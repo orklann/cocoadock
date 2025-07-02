@@ -8,74 +8,68 @@ VALUE cocoadock_initialize(VALUE self);
 VALUE cocoadock_add_app_to_dock(VALUE self, VALUE path);
 VALUE cocoadock_remove_app_from_dock(VALUE self, VALUE path);
 
-void addAppToDock(NSString *appPath) {
-    // Ensure app path is absolute and URL encoded
+void addAppToDock(const char *app_path) {
+    NSString *appPath = [[NSString alloc] initWithCString:app_path encoding:NSUTF8StringEncoding];
+
+    // Convert to file URL with percent escapes
     NSURL *appURL = [NSURL fileURLWithPath:appPath];
-    NSString *urlString = [appURL absoluteString]; // e.g. "file:///Applications/Safari.app"
+    NSString *urlString = appURL.absoluteString;
 
+    // Now form the Dock entry
     NSString *dockEntry = [NSString stringWithFormat:
-        @"'{\"tile-data\"={\"file-data\"={\"_CFURLString\"=\"%@\";\"_CFURLStringType\"=15;};};\"tile-type\"=\"file-tile\";}'",
-        urlString];
+        @"'<dict>"
+         "<key>tile-data</key><dict>"
+           "<key>file-data</key><dict>"
+             "<key>_CFURLString</key><string>%@</string>"
+             "<key>_CFURLStringType</key><integer>15</integer>"
+           "</dict>"
+         "</dict>"
+       "</dict>'", urlString];
 
-    NSString *defaultsWrite = [NSString stringWithFormat:
-        @"defaults write com.apple.dock persistent-apps -array-add %@", dockEntry];
+    NSString *command = [NSString stringWithFormat:
+        @"defaults write com.apple.dock persistent-apps -array-add %@ && killall Dock", dockEntry];
 
-    system([defaultsWrite UTF8String]);
-    system("killall Dock");
-
-    NSLog(@"Added %@ to Dock", appPath);
+    // Execute the command
+    NSTask *task = [[NSTask alloc] init];
+    task.launchPath = @"/bin/sh";
+    task.arguments = @[@"-c", command];
+    [task launch];
 }
 
-void removeAppFromDock(NSString *appPath) {
-    // Read current persistent apps from Dock preferences
-    NSString *plistPath = [@"~/Library/Preferences/com.apple.dock.plist" stringByExpandingTildeInPath];
-    NSMutableDictionary *dockPlist = [NSMutableDictionary dictionaryWithContentsOfFile:plistPath];
-    if (!dockPlist) {
-        NSLog(@"Failed to read Dock plist.");
-        return;
-    }
+void removeAppFromDock(const char* app_path) {
+    NSString *appPath = [[NSString alloc] initWithCString:app_path encoding:NSUTF8StringEncoding];
+    NSURL *appURL = [NSURL fileURLWithPath:appPath];
+    NSString *urlString = appURL.absoluteString;
 
+    // Step 1: Export current Dock preferences
+    NSString *exportPlistCmd = @"defaults export com.apple.dock - > /tmp/com.apple.dock.plist";
+    system([exportPlistCmd UTF8String]);
+
+    // Step 2: Load the plist
+    NSMutableDictionary *dockPlist = [NSMutableDictionary dictionaryWithContentsOfFile:@"/tmp/com.apple.dock.plist"];
     NSMutableArray *persistentApps = [dockPlist[@"persistent-apps"] mutableCopy];
-    if (!persistentApps) {
-        NSLog(@"No persistent apps found in Dock plist.");
-        return;
-    }
+    if (!persistentApps) return;
 
-    // Normalize input app path (resolve symlinks, remove trailing slash)
-    NSString *normalizedAppPath = [[NSURL fileURLWithPath:appPath] path];
-
-    // Filter out any entries whose file URL path matches the app path
-    NSIndexSet *indexesToRemove = [persistentApps indexesOfObjectsPassingTest:^BOOL(NSDictionary *entry, NSUInteger idx, BOOL *stop) {
+    // Step 3: Filter out the app by matching its _CFURLString
+    NSMutableArray *filtered = [NSMutableArray array];
+    for (NSDictionary *entry in persistentApps) {
         NSDictionary *tileData = entry[@"tile-data"];
         NSDictionary *fileData = tileData[@"file-data"];
-        NSString *urlString = fileData[@"_CFURLString"];
-        if (urlString) {
-            NSURL *url = [NSURL URLWithString:urlString];
-            NSString *entryPath = [url path];
-            return [entryPath isEqualToString:normalizedAppPath];
+        NSString *entryURL = fileData[@"_CFURLString"];
+        if (![entryURL isEqualToString:urlString]) {
+            [filtered addObject:entry];
         }
-        return NO;
-    }];
-
-    if (indexesToRemove.count == 0) {
-        NSLog(@"App not found in Dock.");
-        return;
     }
 
-    [persistentApps removeObjectsAtIndexes:indexesToRemove];
-    dockPlist[@"persistent-apps"] = persistentApps;
+    // Step 4: Save updated plist and re-import
+    dockPlist[@"persistent-apps"] = filtered;
+    [dockPlist writeToFile:@"/tmp/com.apple.dock.plist" atomically:YES];
 
-    // Save updated plist back to file
-    BOOL success = [dockPlist writeToFile:plistPath atomically:YES];
-    if (!success) {
-        NSLog(@"Failed to write updated Dock plist.");
-        return;
-    }
+    NSString *importCmd = @"defaults import com.apple.dock /tmp/com.apple.dock.plist";
+    system([importCmd UTF8String]);
 
-    // Restart the Dock to apply changes
+    // Step 5: Restart Dock
     system("killall Dock");
-
-    NSLog(@"Removed %@ from Dock.", appPath);
 }
 
 RUBY_FUNC_EXPORTED void
@@ -95,12 +89,12 @@ VALUE cocoadock_initialize(VALUE self) {
 
 VALUE cocoadock_add_app_to_dock(VALUE self, VALUE path) {
     const char *c_app_path = StringValueCStr(path);
-    NSString *appPath = [[NSString alloc] initWithCString:c_app_path encoding:NSUTF8StringEncoding];
-    addAppToDock(appPath);
+    //NSString *appPath = [[NSString alloc] initWithCString:c_app_path encoding:NSUTF8StringEncoding];
+    addAppToDock(c_app_path);
 }
 
 VALUE cocoadock_remove_app_from_dock(VALUE self, VALUE path) {
     const char *c_app_path = StringValueCStr(path);
-    NSString *appPath = [[NSString alloc] initWithCString:c_app_path encoding:NSUTF8StringEncoding];
-    removeAppFromDock(appPath);
+    //NSString *appPath = [[NSString alloc] initWithCString:c_app_path encoding:NSUTF8StringEncoding];
+    removeAppFromDock(c_app_path);
 }

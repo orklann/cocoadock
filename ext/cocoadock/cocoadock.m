@@ -8,6 +8,69 @@ VALUE cocoadock_initialize(VALUE self);
 VALUE cocoadock_is_app_to_dock(VALUE self, VALUE path);
 VALUE cocoadock_add_app_to_dock(VALUE self, VALUE path);
 VALUE cocoadock_remove_app_from_dock(VALUE self, VALUE path);
+VALUE cocoadock_remove_others_in_dock(VALUE self);
+
+NSMutableArray *LoadDockOthers(void) {
+    CFArrayRef persistentOthers = CFPreferencesCopyAppValue(
+        CFSTR("persistent-others"),
+        CFSTR("com.apple.dock")
+    );
+
+    if (!persistentOthers) {
+        return [NSMutableArray array];
+    }
+
+    NSMutableArray *others =
+        [(__bridge NSArray *)persistentOthers mutableCopy];
+
+    CFRelease(persistentOthers);
+    return others;
+}
+
+void SaveDockOthers(NSArray *others) {
+    CFPreferencesSetAppValue(
+        CFSTR("persistent-others"),
+        (__bridge CFArrayRef)others,
+        CFSTR("com.apple.dock")
+    );
+
+    CFPreferencesAppSynchronize(CFSTR("com.apple.dock"));
+
+    system("killall Dock");
+}
+
+BOOL RemoveOthersInDock(void) {
+
+    int attempts = 0;
+
+    while (attempts < 3) {
+
+        NSMutableArray *others = LoadDockOthers();
+
+        if (others.count == 0) {
+            return YES; // Already empty
+        }
+
+        [others removeAllObjects];
+
+        SaveDockOthers(others);
+
+        // Give Dock time to restart and commit
+        [NSThread sleepForTimeInterval:0.25];
+
+        // Verify
+        NSMutableArray *verify = LoadDockOthers();
+        if (verify.count == 0) {
+            return YES;
+        }
+
+        attempts++;
+        [NSThread sleepForTimeInterval:0.1];
+    }
+
+    return NO;
+}
+
 
 BOOL IsAppInDock(NSString *bundleID) {
     if (!bundleID) return NO;
@@ -236,6 +299,10 @@ void removeAppFromDock(const char* app_path) {
     }
 }
 
+void removeOthersInDock () {
+    RemoveOthersInDock();
+}
+
 RUBY_FUNC_EXPORTED void
 Init_cocoadock(void)
 {
@@ -245,6 +312,7 @@ Init_cocoadock(void)
   rb_define_method(rb_mCocoadockClass, "add_app", cocoadock_add_app_to_dock, 1);
   rb_define_method(rb_mCocoadockClass, "app_in_dock?", cocoadock_is_app_to_dock, 1);
   rb_define_method(rb_mCocoadockClass, "remove_app", cocoadock_remove_app_from_dock, 1);
+  rb_define_method(rb_mCocoadockClass, "remove_others", cocoadock_remove_others_in_dock, 0);
 }
 
 VALUE cocoadock_initialize(VALUE self) {
@@ -270,4 +338,8 @@ VALUE cocoadock_remove_app_from_dock(VALUE self, VALUE path) {
     const char *c_app_path = StringValueCStr(path);
     //NSString *appPath = [[NSString alloc] initWithCString:c_app_path encoding:NSUTF8StringEncoding];
     removeAppFromDock(c_app_path);
+}
+
+VALUE cocoadock_remove_others_in_dock(VALUE self) {
+    removeOthersInDock();
 }

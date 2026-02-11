@@ -5,71 +5,235 @@ VALUE rb_mCocoadock;
 VALUE rb_mCocoadockClass;
 
 VALUE cocoadock_initialize(VALUE self);
+VALUE cocoadock_is_app_to_dock(VALUE self, VALUE path);
 VALUE cocoadock_add_app_to_dock(VALUE self, VALUE path);
 VALUE cocoadock_remove_app_from_dock(VALUE self, VALUE path);
 
-void addAppToDock(const char *app_path) {
-    NSString *appPath = [[NSString alloc] initWithCString:app_path encoding:NSUTF8StringEncoding];
+BOOL IsAppInDock(NSString *bundleID) {
+    if (!bundleID) return NO;
 
-    // Convert to file URL with percent escapes
-    NSURL *appURL = [NSURL fileURLWithPath:appPath];
-    NSString *urlString = appURL.absoluteString;
+    // Load Dock plist directly
+    NSString *plistPath = [@"~/Library/Preferences/com.apple.dock.plist" stringByExpandingTildeInPath];
+    NSDictionary *dockPlist = [NSDictionary dictionaryWithContentsOfFile:plistPath];
+    NSArray *persistentApps = dockPlist[@"persistent-apps"];
+    if (!persistentApps) return NO;
 
-    // Now form the Dock entry
-    NSString *dockEntry = [NSString stringWithFormat:
-        @"'<dict>"
-         "<key>tile-data</key><dict>"
-           "<key>file-data</key><dict>"
-             "<key>_CFURLString</key><string>%@</string>"
-             "<key>_CFURLStringType</key><integer>15</integer>"
-           "</dict>"
-         "</dict>"
-       "</dict>'", urlString];
+    for (NSDictionary *item in persistentApps) {
+        NSDictionary *tileData = item[@"tile-data"];
+        if (!tileData) continue;
 
-    NSString *command = [NSString stringWithFormat:
-        @"defaults write com.apple.dock persistent-apps -array-add %@ && killall Dock", dockEntry];
+        // 1️⃣ Check bundle identifier
+        NSString *appBundleID = tileData[@"bundle-identifier"];
+        if ([appBundleID isEqualToString:bundleID]) {
+            return YES;
+        }
 
-    // Execute the command
-    NSTask *task = [[NSTask alloc] init];
-    task.launchPath = @"/bin/sh";
-    task.arguments = @[@"-c", command];
-    [task launch];
-}
-
-void removeAppFromDock(const char* app_path) {
-    NSString *appPath = [[NSString alloc] initWithCString:app_path encoding:NSUTF8StringEncoding];
-    NSURL *appURL = [NSURL fileURLWithPath:appPath];
-    NSString *urlString = appURL.absoluteString;
-
-    // Step 1: Export current Dock preferences
-    NSString *exportPlistCmd = @"defaults export com.apple.dock - > /tmp/com.apple.dock.plist";
-    system([exportPlistCmd UTF8String]);
-
-    // Step 2: Load the plist
-    NSMutableDictionary *dockPlist = [NSMutableDictionary dictionaryWithContentsOfFile:@"/tmp/com.apple.dock.plist"];
-    NSMutableArray *persistentApps = [dockPlist[@"persistent-apps"] mutableCopy];
-    if (!persistentApps) return;
-
-    // Step 3: Filter out the app by matching its _CFURLString
-    NSMutableArray *filtered = [NSMutableArray array];
-    for (NSDictionary *entry in persistentApps) {
-        NSDictionary *tileData = entry[@"tile-data"];
+        // 2️⃣ Fallback: check file path
         NSDictionary *fileData = tileData[@"file-data"];
-        NSString *entryURL = fileData[@"_CFURLString"];
-        if (![entryURL isEqualToString:urlString]) {
-            [filtered addObject:entry];
+        NSString *path = fileData[@"_CFURLString"];
+        if (!path) continue;
+
+        // Handle possible URL or relative path
+        if (![path hasPrefix:@"/"]) {
+            NSURL *url = [NSURL URLWithString:path];
+            path = url.path;
+        }
+
+        if (!path) continue;
+
+        // Resolve symlinks
+        path = [[NSURL fileURLWithPath:path] URLByResolvingSymlinksInPath].path;
+
+        NSBundle *bundle = [NSBundle bundleWithPath:path];
+        if (bundle && [bundle.bundleIdentifier isEqualToString:bundleID]) {
+            return YES;
         }
     }
 
-    // Step 4: Save updated plist and re-import
-    dockPlist[@"persistent-apps"] = filtered;
-    [dockPlist writeToFile:@"/tmp/com.apple.dock.plist" atomically:YES];
+    return NO;
+}
 
-    NSString *importCmd = @"defaults import com.apple.dock /tmp/com.apple.dock.plist";
-    system([importCmd UTF8String]);
 
-    // Step 5: Restart Dock
-    system("killall Dock");
+NSURL *AppURLForBundleID(NSString *bundleID) {
+    if (!bundleID) return nil;
+
+    CFArrayRef urls = LSCopyApplicationURLsForBundleIdentifier(
+        (__bridge CFStringRef)bundleID,
+        NULL
+    );
+
+    if (!urls || CFArrayGetCount(urls) == 0) {
+        if (urls) CFRelease(urls);
+        return nil;
+    }
+
+    CFURLRef firstURL = CFArrayGetValueAtIndex(urls, 0);
+    NSURL *appURL = (__bridge NSURL *)firstURL;
+
+    CFRelease(urls); // release the array, not the item
+    return appURL;
+}
+
+NSDictionary *DockTileForAppURL(NSURL *appURL) {
+    if (!appURL) return nil;
+
+    NSDictionary *fileData = @{
+        @"_CFURLString": appURL.absoluteString,
+        @"_CFURLStringType": @15
+    };
+
+    NSDictionary *tileData = @{
+        @"file-data": fileData
+    };
+
+    return @{
+        @"tile-type": @"file-tile",
+        @"tile-data": tileData
+    };
+}
+
+void AddDockAppByBundleID(NSString *bundleID) {
+    CFArrayRef persistentApps = CFPreferencesCopyAppValue(
+        CFSTR("persistent-apps"),
+        CFSTR("com.apple.dock")
+    );
+
+    if (!persistentApps) {
+        NSLog(@"Failed to read Dock preferences");
+        return;
+    }
+
+    NSMutableArray *apps =
+        [(__bridge NSArray *)persistentApps mutableCopy];
+
+    if (!apps || !bundleID) return;
+
+    NSURL *appURL = AppURLForBundleID(bundleID);
+    if (!appURL) {
+        NSLog(@"Could not resolve app for bundle ID %@", bundleID);
+        return;
+    }
+
+    NSString *targetPath = appURL.path;
+
+    // Prevent duplicates
+    for (NSDictionary *item in apps) {
+        NSDictionary *fileData = item[@"tile-data"][@"file-data"];
+        NSString *urlString = fileData[@"_CFURLString"];
+        if (!urlString) continue;
+
+        NSString *path = [[NSURL URLWithString:urlString] path];
+        if ([path isEqualToString:targetPath]) {
+            return;
+        }
+    }
+
+    NSDictionary *dockItem = DockTileForAppURL(appURL);
+    if (dockItem) {
+        [apps addObject:dockItem];
+    }
+
+    CFPreferencesSetAppValue(
+        CFSTR("persistent-apps"),
+        (__bridge CFArrayRef)apps,
+        CFSTR("com.apple.dock")
+    );
+
+    CFPreferencesAppSynchronize(CFSTR("com.apple.dock"));
+
+    CFRelease(persistentApps);
+}
+
+void RemoveDockAppByBundleID(NSString *bundleID) {
+    CFArrayRef persistentApps = CFPreferencesCopyAppValue(
+        CFSTR("persistent-apps"),
+        CFSTR("com.apple.dock")
+    );
+
+    NSMutableArray *apps =
+        [(__bridge NSArray *)persistentApps mutableCopy];
+
+    if (!apps || !bundleID) {
+        return;
+    }
+
+    for (NSInteger i = apps.count - 1; i >= 0; i--) {
+        NSDictionary *item = apps[i];
+        NSDictionary *tileData = item[@"tile-data"];
+
+        NSString *dockBundleID = tileData[@"bundle-identifier"];
+        if ([dockBundleID isEqualToString:bundleID]) {
+            [apps removeObjectAtIndex:i];
+            continue;
+        }
+
+        NSDictionary *fileData = tileData[@"file-data"];
+        NSString *urlString = fileData[@"_CFURLString"];
+        if (urlString) {
+            NSString *path = [[NSURL URLWithString:urlString] path];
+            if ([path containsString:bundleID]) {
+                [apps removeObjectAtIndex:i];
+            }
+        }
+    }
+
+    CFPreferencesSetAppValue(
+        CFSTR("persistent-apps"),
+        (__bridge CFArrayRef)apps,
+        CFSTR("com.apple.dock")
+    );
+
+    CFPreferencesAppSynchronize(CFSTR("com.apple.dock"));
+
+    if (persistentApps) {
+        CFRelease(persistentApps);
+    }
+}
+
+BOOL isAppInDock(const char *app_path) {
+    NSString *appPath = [[NSString alloc] initWithCString:app_path encoding:NSUTF8StringEncoding];
+    NSBundle *bundle = [NSBundle bundleWithPath:appPath];
+
+    if (!bundle) {
+        NSLog(@"Not a valid app bundle");
+        return NO;
+    }
+ 
+    NSString *bundleID = bundle.bundleIdentifier;
+
+    return IsAppInDock(bundleID);
+}
+
+void addAppToDock(const char *app_path) {
+    @autoreleasepool {
+        NSString *appPath = [[NSString alloc] initWithCString:app_path encoding:NSUTF8StringEncoding];
+
+        NSBundle *bundle = [NSBundle bundleWithPath:appPath];
+
+        if (!bundle) {
+            NSLog(@"Not a valid app bundle");
+            return;
+        }
+     
+        NSString *bundleID = bundle.bundleIdentifier;
+        AddDockAppByBundleID(bundleID);
+    }
+}
+
+void removeAppFromDock(const char* app_path) {
+    @autoreleasepool {
+        NSString *appPath = [[NSString alloc] initWithCString:app_path encoding:NSUTF8StringEncoding];
+
+        NSBundle *bundle = [NSBundle bundleWithPath:appPath];
+
+        if (!bundle) {
+            NSLog(@"Not a valid app bundle");
+            return;
+        }
+     
+        NSString *bundleID = bundle.bundleIdentifier;
+        RemoveDockAppByBundleID(bundleID);
+    }
 }
 
 RUBY_FUNC_EXPORTED void
@@ -79,6 +243,7 @@ Init_cocoadock(void)
   rb_mCocoadockClass = rb_define_class_under(rb_mCocoadock, "CocoaDock", rb_cObject);
   rb_define_method(rb_mCocoadockClass, "initialize", cocoadock_initialize, 0);
   rb_define_method(rb_mCocoadockClass, "add_app", cocoadock_add_app_to_dock, 1);
+  rb_define_method(rb_mCocoadockClass, "app_in_dock?", cocoadock_is_app_to_dock, 1);
   rb_define_method(rb_mCocoadockClass, "remove_app", cocoadock_remove_app_from_dock, 1);
 }
 
@@ -87,9 +252,17 @@ VALUE cocoadock_initialize(VALUE self) {
   return self;
 }
 
+VALUE cocoadock_is_app_to_dock(VALUE self, VALUE path) {
+    const char *c_app_path = StringValueCStr(path);
+    BOOL result = isAppInDock(c_app_path);
+    if (result == YES) {
+        return Qtrue;
+    }
+    return Qfalse;
+}
+
 VALUE cocoadock_add_app_to_dock(VALUE self, VALUE path) {
     const char *c_app_path = StringValueCStr(path);
-    //NSString *appPath = [[NSString alloc] initWithCString:c_app_path encoding:NSUTF8StringEncoding];
     addAppToDock(c_app_path);
 }
 
